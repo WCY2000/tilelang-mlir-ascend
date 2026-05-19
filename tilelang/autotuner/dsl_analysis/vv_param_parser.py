@@ -96,14 +96,19 @@ TileLang pattern reference
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from .axis_length_resolver import classify_length_symbol
-from .axis_semantic_schema import (AxisExtent, AxisSemanticInfo,
-                                   AxisSemanticResult, AxisSplit, AxisTiling)
+from .axis_semantic_schema import (
+    AxisExtent,
+    AxisSemanticInfo,
+    AxisSemanticResult,
+    AxisSplit,
+    AxisTiling,
+)
 from .dynamic_source_utils import resolve_dynamic_source
-from .schema import (AXIS_LENGTH_STATE_TUNABLE, ParameterSpec, SignatureInfo)
+from .schema import AXIS_LENGTH_STATE_TUNABLE, ParameterSpec, SignatureInfo
 from .vv_param_parser_v2 import VvAxisInfoV2, VvAxisParseResultV2
 
 # ---------------------------------------------------------------------------
@@ -119,6 +124,7 @@ _LOOP_RANGE_IDS: frozenset = frozenset(("range", "tl_range"))
 # ---------------------------------------------------------------------------
 # Low-level AST helpers
 # ---------------------------------------------------------------------------
+
 
 def _is_t_attr(node: ast.AST, attr: str) -> bool:
     return (
@@ -177,6 +183,7 @@ def _ast_to_text(node: ast.AST) -> str:
 # Function-node resolution
 # ---------------------------------------------------------------------------
 
+
 def _resolve_function_node(
     func_ast: ast.AST,
     module_ast: Optional[ast.AST] = None,
@@ -191,6 +198,7 @@ def _resolve_function_node(
     3. First non-prim_func function containing a T.Kernel call.
     4. First non-prim_func function (last-resort fallback).
     """
+
     def _find_by_name(tree: ast.AST, name: str) -> Optional[ast.AST]:
         for node in ast.walk(tree):
             if (
@@ -211,9 +219,10 @@ def _resolve_function_node(
             if found is not None:
                 return found
 
-    if isinstance(func_ast, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if not _is_prim_func_decorated(func_ast):
-            return func_ast
+    if isinstance(
+        func_ast, (ast.FunctionDef, ast.AsyncFunctionDef)
+    ) and not _is_prim_func_decorated(func_ast):
+        return func_ast
 
     search_root = module_ast if module_ast is not None else func_ast
     for node in ast.walk(search_root):
@@ -226,9 +235,10 @@ def _resolve_function_node(
                 return node
 
     for node in ast.walk(search_root):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            if not _is_prim_func_decorated(node):
-                return node
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ) and not _is_prim_func_decorated(node):
+            return node
 
     return func_ast
 
@@ -236,6 +246,7 @@ def _resolve_function_node(
 # ---------------------------------------------------------------------------
 # Parameter helpers
 # ---------------------------------------------------------------------------
+
 
 def _get_function_param_names(func_node: ast.AST) -> List[str]:
     """Return all positional + keyword-only parameter names."""
@@ -254,8 +265,7 @@ def _get_default_param_names(func_node: ast.AST) -> Set[str]:
     positional = list(args.posonlyargs) + list(args.args)
     n_defaults = len(args.defaults)
     defaults: Set[str] = {
-        positional[i].arg
-        for i in range(len(positional) - n_defaults, len(positional))
+        positional[i].arg for i in range(len(positional) - n_defaults, len(positional))
     }
     for i, arg in enumerate(args.kwonlyargs):
         if i < len(args.kw_defaults) and args.kw_defaults[i] is not None:
@@ -266,6 +276,7 @@ def _get_default_param_names(func_node: ast.AST) -> Set[str]:
 # ---------------------------------------------------------------------------
 # Ceildiv parameter classification
 # ---------------------------------------------------------------------------
+
 
 def _extract_ceildiv_divisor_names(func_ast: ast.AST) -> Set[str]:
     """
@@ -322,6 +333,7 @@ def _extract_ceildiv_numerator_param_names(
 # ---------------------------------------------------------------------------
 # TileLang-specific signature builder
 # ---------------------------------------------------------------------------
+
 
 def _build_tl_signature(
     func_node: ast.AST,
@@ -386,7 +398,9 @@ def _build_tl_signature(
     #
     # This prevents M from being classified as TUNABLE (autotuner target) when
     # no concrete value is supplied — M is a runtime shape, not a tile-size knob.
-    problem_dim_params = _extract_ceildiv_numerator_param_names(func_node, all_param_names)
+    problem_dim_params = _extract_ceildiv_numerator_param_names(
+        func_node, all_param_names
+    )
     provided_keys = set(provided_args.keys())
     provided_problem_dims = problem_dim_params & provided_keys
 
@@ -410,6 +424,7 @@ def _build_tl_signature(
 # ---------------------------------------------------------------------------
 # Tunable-parameter resolution
 # ---------------------------------------------------------------------------
+
 
 def _resolve_tunable_params(
     func_node: ast.AST,
@@ -448,6 +463,7 @@ def _resolve_tunable_params(
 # Ceildiv alias map  (var = T.ceildiv(axis, param))
 # ---------------------------------------------------------------------------
 
+
 def _build_ceildiv_alias_map(func_ast: ast.AST) -> Dict[str, Tuple[str, str]]:
     """
     Build ``{alias_var: (axis_expr_text, param_name)}`` for every
@@ -477,6 +493,7 @@ def _build_ceildiv_alias_map(func_ast: ast.AST) -> Dict[str, Tuple[str, str]]:
 # Internal evidence dataclasses
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class _SplitEvidence:
     axis_name: str
@@ -502,6 +519,7 @@ class _TilingEvidence:
 # Split evidence extraction
 # ---------------------------------------------------------------------------
 
+
 def _process_kernel_arg(
     arg: ast.AST,
     dim_idx: int,
@@ -519,10 +537,14 @@ def _process_kernel_arg(
     # Product: T.ceildiv(M,bM) * T.ceildiv(N,bN) — recurse both sides
     if isinstance(arg, ast.BinOp) and isinstance(arg.op, ast.Mult):
         results.extend(
-            _process_kernel_arg(arg.left, dim_idx, tunable_params, ceildiv_alias_map, seen_params)
+            _process_kernel_arg(
+                arg.left, dim_idx, tunable_params, ceildiv_alias_map, seen_params
+            )
         )
         results.extend(
-            _process_kernel_arg(arg.right, dim_idx, tunable_params, ceildiv_alias_map, seen_params)
+            _process_kernel_arg(
+                arg.right, dim_idx, tunable_params, ceildiv_alias_map, seen_params
+            )
         )
         return results
 
@@ -532,10 +554,14 @@ def _process_kernel_arg(
         if param_text in tunable_params and param_text not in seen_params:
             axis_text = _ast_to_text(arg.args[0])
             seen_params.add(param_text)
-            results.append(_SplitEvidence(
-                axis_name=axis_text, param_name=param_text,
-                pid_dim=dim_idx, axis_total_expr=axis_text,
-            ))
+            results.append(
+                _SplitEvidence(
+                    axis_name=axis_text,
+                    param_name=param_text,
+                    pid_dim=dim_idx,
+                    axis_total_expr=axis_text,
+                )
+            )
         return results
 
     # Floor-div shorthand: (axis + param - 1) // param
@@ -544,10 +570,14 @@ def _process_kernel_arg(
         if param_text in tunable_params and param_text not in seen_params:
             axis_text = _ast_to_text(arg.left)
             seen_params.add(param_text)
-            results.append(_SplitEvidence(
-                axis_name=axis_text, param_name=param_text,
-                pid_dim=dim_idx, axis_total_expr=axis_text,
-            ))
+            results.append(
+                _SplitEvidence(
+                    axis_name=axis_text,
+                    param_name=param_text,
+                    pid_dim=dim_idx,
+                    axis_total_expr=axis_text,
+                )
+            )
         return results
 
     # Alias reference: grid_m → ceildiv_alias_map
@@ -555,10 +585,14 @@ def _process_kernel_arg(
         axis_text, param_text = ceildiv_alias_map[arg.id]
         if param_text in tunable_params and param_text not in seen_params:
             seen_params.add(param_text)
-            results.append(_SplitEvidence(
-                axis_name=axis_text, param_name=param_text,
-                pid_dim=dim_idx, axis_total_expr=axis_text,
-            ))
+            results.append(
+                _SplitEvidence(
+                    axis_name=axis_text,
+                    param_name=param_text,
+                    pid_dim=dim_idx,
+                    axis_total_expr=axis_text,
+                )
+            )
 
     return results
 
@@ -617,11 +651,16 @@ def _fallback_split_scan(
         if param_text not in tunable_params or param_text in seen_params:
             continue
         seen_params.add(param_text)
-        results.append(_SplitEvidence(
-            axis_name=axis_text, param_name=param_text,
-            pid_dim=dim_counter, axis_total_expr=axis_text,
-            source="fallback_divmod", confidence=0.75,
-        ))
+        results.append(
+            _SplitEvidence(
+                axis_name=axis_text,
+                param_name=param_text,
+                pid_dim=dim_counter,
+                axis_total_expr=axis_text,
+                source="fallback_divmod",
+                confidence=0.75,
+            )
+        )
         dim_counter += 1
 
     for node in ast.walk(func_ast):
@@ -635,11 +674,16 @@ def _fallback_split_scan(
             continue
         param_text = node.right.id
         seen_params.add(param_text)
-        results.append(_SplitEvidence(
-            axis_name=_ast_to_text(node.left), param_name=param_text,
-            pid_dim=dim_counter, axis_total_expr=_ast_to_text(node.left),
-            source="fallback_floordiv", confidence=0.60,
-        ))
+        results.append(
+            _SplitEvidence(
+                axis_name=_ast_to_text(node.left),
+                param_name=param_text,
+                pid_dim=dim_counter,
+                axis_total_expr=_ast_to_text(node.left),
+                source="fallback_floordiv",
+                confidence=0.60,
+            )
+        )
         dim_counter += 1
 
     return results
@@ -650,11 +694,15 @@ def _extract_split_evidence(
     tunable_params: Set[str],
     ceildiv_alias_map: Dict[str, Tuple[str, str]],
 ) -> List[_SplitEvidence]:
-    primary = _extract_split_evidence_from_kernel(func_ast, tunable_params, ceildiv_alias_map)
+    primary = _extract_split_evidence_from_kernel(
+        func_ast, tunable_params, ceildiv_alias_map
+    )
     found_params = {ev.param_name for ev in primary}
     if len(found_params) < len(tunable_params):
         primary.extend(
-            _fallback_split_scan(func_ast, tunable_params, ceildiv_alias_map, found_params)
+            _fallback_split_scan(
+                func_ast, tunable_params, ceildiv_alias_map, found_params
+            )
         )
     return primary
 
@@ -662,6 +710,7 @@ def _extract_split_evidence(
 # ---------------------------------------------------------------------------
 # Tiling / reduction loop extraction
 # ---------------------------------------------------------------------------
+
 
 def _body_has_reduction(stmts: List[ast.stmt]) -> bool:
     for stmt in stmts:
@@ -752,15 +801,17 @@ def _extract_tiling_evidence(
         is_reduction = is_pipelined or _body_has_reduction(node.body)
         loop_var = node.target.id if isinstance(node.target, ast.Name) else None
 
-        results.append(_TilingEvidence(
-            axis_name=axis_total_expr,
-            param_name=param_name,
-            is_reduction=is_reduction,
-            axis_total_expr=axis_total_expr,
-            loop_var=loop_var,
-            source="T.Pipelined" if is_pipelined else "range",
-            confidence=0.90 if is_pipelined else 0.80,
-        ))
+        results.append(
+            _TilingEvidence(
+                axis_name=axis_total_expr,
+                param_name=param_name,
+                is_reduction=is_reduction,
+                axis_total_expr=axis_total_expr,
+                loop_var=loop_var,
+                source="T.Pipelined" if is_pipelined else "range",
+                confidence=0.90 if is_pipelined else 0.80,
+            )
+        )
 
     return results
 
@@ -768,6 +819,7 @@ def _extract_tiling_evidence(
 # ---------------------------------------------------------------------------
 # Low-dim extraction
 # ---------------------------------------------------------------------------
+
 
 def _shape_elt_to_axis(
     elt: ast.AST,
@@ -836,6 +888,7 @@ def _extract_low_dim_axes(
 # Axis extent construction
 # ---------------------------------------------------------------------------
 
+
 def _build_axis_extent(
     axis_name: str,
     signature: SignatureInfo,
@@ -877,6 +930,7 @@ def _build_axis_extent(
 # Main semantic analysis
 # ---------------------------------------------------------------------------
 
+
 def parse_tl_axis_semantic(
     func_ast: ast.AST,
     provided_args: Optional[Mapping[str, object]] = None,
@@ -917,10 +971,14 @@ def parse_tl_axis_semantic(
     ceildiv_alias_map = _build_ceildiv_alias_map(func_node)
 
     # 5. Split evidence (T.Kernel grid args)
-    split_evidences = _extract_split_evidence(func_node, tunable_params, ceildiv_alias_map)
+    split_evidences = _extract_split_evidence(
+        func_node, tunable_params, ceildiv_alias_map
+    )
 
     # 6. Tiling / reduction evidence (loops)
-    tiling_evidences = _extract_tiling_evidence(func_node, tunable_params, ceildiv_alias_map)
+    tiling_evidences = _extract_tiling_evidence(
+        func_node, tunable_params, ceildiv_alias_map
+    )
 
     # 7. param → axis mapping (for low-dim extraction)
     param_to_axis: Dict[str, str] = {}
@@ -930,21 +988,23 @@ def parse_tl_axis_semantic(
         param_to_axis.setdefault(ev.param_name, ev.axis_name)
 
     # 8. Low-dim axes
-    low_dim_axes_list = _extract_low_dim_axes(func_node, param_to_axis, ceildiv_alias_map)
+    low_dim_axes_list = _extract_low_dim_axes(
+        func_node, param_to_axis, ceildiv_alias_map
+    )
     low_dim_set = set(low_dim_axes_list)
 
     # 9. Ordered unique axis list: split axes (by pid_dim), then tiling-only
     ordered_axes: List[str] = []
     seen_axes: Set[str] = set()
 
-    pid_to_axis: Dict[int, str] = {}
+    pid_to_axes: Dict[int, List[str]] = {}
     for ev in split_evidences:
-        pid_to_axis.setdefault(ev.pid_dim, ev.axis_name)
-    for pid_dim in sorted(pid_to_axis):
-        ax = pid_to_axis[pid_dim]
-        if ax not in seen_axes:
-            ordered_axes.append(ax)
-            seen_axes.add(ax)
+        pid_to_axes.setdefault(ev.pid_dim, []).append(ev.axis_name)
+    for pid_dim in sorted(pid_to_axes):
+        for ax in pid_to_axes[pid_dim]:
+            if ax not in seen_axes:
+                ordered_axes.append(ax)
+                seen_axes.add(ax)
 
     for ev in tiling_evidences:
         if ev.axis_name not in seen_axes:
@@ -953,13 +1013,18 @@ def parse_tl_axis_semantic(
 
     if not ordered_axes:
         return AxisSemanticResult(
-            axes={}, axis_length_exprs={}, fixed_tiling_exprs={},
-            axis_pid_dims={}, inferred_keys={}, split_params={},
-            tiling_params={}, low_dim_axes=[], reduction_axes=[],
+            axes={},
+            axis_length_exprs={},
+            fixed_tiling_exprs={},
+            axis_pid_dims={},
+            inferred_keys={},
+            split_params={},
+            tiling_params={},
+            low_dim_axes=[],
+            reduction_axes=[],
             status="failed",
-            diagnostics=diagnostics + [
-                "no axis information resolved from T.Kernel / T.Pipelined / range"
-            ],
+            diagnostics=diagnostics
+            + ["no axis information resolved from T.Kernel / T.Pipelined / range"],
         )
 
     # 10. Aggregate dicts
@@ -1019,8 +1084,12 @@ def parse_tl_axis_semantic(
             tiling=AxisTiling(
                 param=tiling_params.get(axis_name),
                 loop_var=tev.loop_var if tev else None,
-                source=tev.source if tev else ("T.Pipelined" if is_reduction else "range"),
-                confidence=tev.confidence if (tev and axis_name in tiling_params) else 0.0,
+                source=tev.source
+                if tev
+                else ("T.Pipelined" if is_reduction else "range"),
+                confidence=tev.confidence
+                if (tev and axis_name in tiling_params)
+                else 0.0,
                 fixed_expr=None,
             ),
             is_low_dim=(axis_name in low_dim_set),
@@ -1050,6 +1119,7 @@ def parse_tl_axis_semantic(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def _axis_sort_key(axis_name: str) -> Tuple[int, str]:
     return (1 if axis_name.startswith("r") else 0, axis_name)
@@ -1104,20 +1174,22 @@ def parse_tl_axis_info(
 
         axis_dynamic_sources[axis_name] = extent.dynamic_source
 
-        legacy_axes.append(VvAxisInfoV2(
-            axis_index=axis_index,
-            length_expr=extent.expr,
-            axis_symbol=axis_name,
-            state=extent.state,
-            tunable_param=tunable_param,
-            const_value=extent.const_value,
-            split_param=info.split.param,
-            tiling_param=info.tiling.param,
-            fixed_tiling_expr=info.tiling.fixed_expr,
-            is_low_dim=info.is_low_dim,
-            is_reduction=info.is_reduction,
-            dynamic_source=extent.dynamic_source,
-        ))
+        legacy_axes.append(
+            VvAxisInfoV2(
+                axis_index=axis_index,
+                length_expr=extent.expr,
+                axis_symbol=axis_name,
+                state=extent.state,
+                tunable_param=tunable_param,
+                const_value=extent.const_value,
+                split_param=info.split.param,
+                tiling_param=info.tiling.param,
+                fixed_tiling_expr=info.tiling.fixed_expr,
+                is_low_dim=info.is_low_dim,
+                is_reduction=info.is_reduction,
+                dynamic_source=extent.dynamic_source,
+            )
+        )
 
     return VvAxisParseResultV2(
         axis_count=len(legacy_axes),

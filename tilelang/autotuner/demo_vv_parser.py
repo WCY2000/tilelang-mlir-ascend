@@ -1,5 +1,5 @@
 """
-Demo: parse_tilelang_axes — TileLang-Ascend axis parser entry point.
+Demo: parse_tl_axis_info — TileLang-Ascend VV axis parser entry point.
 
 Covers three kernel patterns:
   1. 2D elementwise  — product-flattened Ascend grid, no reduction
@@ -14,17 +14,20 @@ import ast
 import inspect
 import os
 import textwrap
+from dataclasses import asdict
+from pprint import pprint
 
 import tilelang.language as T
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
-from tilelang.autotuner.vv_parser import parse_tilelang_axes
+from tilelang.autotuner.dsl_analysis.vv_param_parser import parse_tl_axis_info
 
 
 # ---------------------------------------------------------------------------
 # Kernel definitions
 # ---------------------------------------------------------------------------
+
 
 def elementwise_add_2d(M, N, block_M, block_N):
     """
@@ -34,6 +37,7 @@ def elementwise_add_2d(M, N, block_M, block_N):
     T.ceildiv(N, block_N) * T.ceildiv(M, block_M), then the kernel body
     decomposes the flat index with div/mod to recover (by, bx).
     """
+
     @T.prim_func
     def elemAdd(
         A: T.Tensor((M, N), "float16"),
@@ -45,21 +49,24 @@ def elementwise_add_2d(M, N, block_M, block_N):
             is_npu=True,
         ) as (cid, _):
             by = cid // T.ceildiv(N, block_N)
-            bx = cid %  T.ceildiv(N, block_N)
+            bx = cid % T.ceildiv(N, block_N)
             A_shared = T.alloc_shared((block_M, block_N), "float16")
             B_shared = T.alloc_shared((block_M, block_N), "float16")
-            C_local  = T.alloc_fragment((block_M, block_N), "float16")
+            C_local = T.alloc_fragment((block_M, block_N), "float16")
             T.copy(A[by * block_M, bx * block_N], A_shared)
             T.copy(B[by * block_M, bx * block_N], B_shared)
             T.vadd(A_shared, B_shared, C_local)
             T.copy(C_local, C[by * block_M, bx * block_N])
+
     return elemAdd
+
 
 def elementwise_add_1d(M, block_M):
     """
     1D elementwise — no default values, no type annotations on block_M.
     This is the real-world pattern from the autotuner test suite.
     """
+
     @T.prim_func
     def elemAdd(
         A: T.Tensor((M,), "float16"),
@@ -67,20 +74,22 @@ def elementwise_add_1d(M, block_M):
         C: T.Tensor((M,), "float16"),
     ):
         with T.Kernel(T.ceildiv(M, block_M), is_npu=True) as (bid, _):
-            offset   = bid * block_M
+            offset = bid * block_M
             A_shared = T.alloc_shared((block_M,), "float16")
             B_shared = T.alloc_shared((block_M,), "float16")
-            C_local  = T.alloc_fragment((block_M,), "float16")
+            C_local = T.alloc_fragment((block_M,), "float16")
             T.copy(A[offset], A_shared)
             T.copy(B[offset], B_shared)
             T.vadd(A_shared, B_shared, C_local)
             T.copy(C_local, C[offset])
+
     return elemAdd
 
 
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
+
 
 def _parse_kernel(fn: object) -> ast.AST:
     source = textwrap.dedent(inspect.getsource(fn))
@@ -92,54 +101,43 @@ def _print_result(label: str, result) -> None:
     print(f"\n{sep}")
     print(f"  {label}")
     print(sep)
-    print(f"  Status:          {result.status}")
-    print(f"  Inferred keys:   {result.inferred_keys}")
-    print(f"  Split params:    {result.split_params}")
-    print(f"  Tiling params:   {result.tiling_params}")
-    print(f"  Reduction axes:  {result.reduction_axes}")
-    print(f"  Low dim axes:    {result.low_dim_axes}")
-    print(f"  Axis pid dims:   {result.axis_pid_dims}")
-    print(f"  Buf count:       {result.buf_count}")
-    print(f"  Buffer params:   {result.buffer_params}")
-    if result.diagnostics:
-        print(f"  Diagnostics:     {result.diagnostics}")
+    pprint(asdict(result), sort_dicts=False)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
 
     # ── Case 1: 2D elementwise (product-flattened Ascend grid) ────────────
-    result1 = parse_tilelang_axes(
+    result1 = parse_tl_axis_info(
         _parse_kernel(elementwise_add_2d),
         provided_args={"M": 1024, "N": 1024},
     )
     _print_result("2D Elementwise  (product-flattened Ascend grid)", result1)
 
     assert result1.status == "ok"
+    assert result1.axis_count == 2
     assert "block_M" in result1.split_params.values()
     assert "block_N" in result1.split_params.values()
     assert result1.tiling_params == {}
     assert result1.reduction_axes == []
-    assert result1.buf_count == 3
-    assert set(result1.buffer_params) == {"A", "B", "C"}
 
     # ── Case 2: 1D elementwise (no default, no annotation) ────────────────
-    result2 = parse_tilelang_axes(
+    result2 = parse_tl_axis_info(
         _parse_kernel(elementwise_add_1d),
         provided_args={"M": 2048},
     )
     _print_result("1D Elementwise  (no default, no annotation on block_M)", result2)
 
     assert result2.status == "ok"
+    assert result2.axis_count == 1
     assert result2.split_params == {"M": "block_M"}
     assert result2.tiling_params == {}
     assert result2.reduction_axes == []
     assert result2.axis_pid_dims == {"M": 0}
-    assert result2.buf_count == 3
-    assert set(result2.buffer_params) == {"A", "B", "C"}
 
     print("\n" + "=" * 60)
     print("  All assertions passed ✓")
