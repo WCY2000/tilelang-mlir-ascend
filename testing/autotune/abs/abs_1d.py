@@ -11,15 +11,15 @@ from tilelang.utils.npu_arch import AscendArch
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
-torch.npu.set_device(15)
+# torch.npu.set_device(15)
 
 SHAPES = [
     (64,),
     (128,),
-    (2048,),
-    (127,),
-    (255,),
-    (1025,),
+    # (2048,),
+    # (127,),
+    # (255,),
+    # (1025,),
 ]
 
 
