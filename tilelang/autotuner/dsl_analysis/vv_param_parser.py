@@ -96,7 +96,10 @@ TileLang pattern reference
 from __future__ import annotations
 
 import ast
-from dataclasses import dataclass
+import inspect
+import textwrap
+from dataclasses import asdict, dataclass
+from pprint import pprint
 from typing import Dict, List, Mapping, Optional, Set, Tuple
 
 from .axis_length_resolver import classify_length_symbol
@@ -1123,6 +1126,56 @@ def parse_tl_axis_semantic(
 
 def _axis_sort_key(axis_name: str) -> Tuple[int, str]:
     return (1 if axis_name.startswith("r") else 0, axis_name)
+
+
+def parse_tl_kernel_ast(fn: object) -> ast.AST:
+    """
+    Return a parseable AST for a TileLang kernel generator.
+
+    The helper accepts a plain Python function, a ``@tilelang.jit`` wrapper,
+    or an ``@tilelang.autotune`` wrapper around a jit function.
+    """
+    raw_fn = fn
+
+    if hasattr(fn, "jit_impl") and hasattr(fn.jit_impl, "func"):
+        raw_fn = fn.jit_impl.func
+    elif hasattr(fn, "__jit_impl__") and hasattr(fn.__jit_impl__, "func"):
+        raw_fn = fn.__jit_impl__.func
+    elif hasattr(fn, "__wrapped__"):
+        raw_fn = fn.__wrapped__
+
+    source = textwrap.dedent(inspect.getsource(raw_fn))
+    lines = source.splitlines()
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("def "):
+            source = textwrap.dedent("\n".join(lines[index:]))
+            break
+
+    return ast.parse(source)
+
+
+def print_vv_axis_parse_result(label: str, result: VvAxisParseResultV2) -> None:
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"  {label}")
+    print(sep)
+    pprint(asdict(result), sort_dicts=False)
+
+
+def parse_tl_axis_info_from_fn(
+    fn: object,
+    provided_args: Optional[Mapping[str, object]] = None,
+    hints: Optional[Mapping[str, object]] = None,
+    module_ast: Optional[ast.AST] = None,
+    entry_function_name: Optional[str] = None,
+) -> VvAxisParseResultV2:
+    return parse_tl_axis_info(
+        parse_tl_kernel_ast(fn),
+        provided_args=provided_args,
+        hints=hints,
+        module_ast=module_ast,
+        entry_function_name=entry_function_name,
+    )
 
 
 def parse_tl_axis_info(

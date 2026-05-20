@@ -1,27 +1,24 @@
 """
 Demo: parse_tl_axis_info — TileLang-Ascend VV axis parser entry point.
 
-Covers three kernel patterns:
+Covers two kernel patterns:
   1. 2D elementwise  — product-flattened Ascend grid, no reduction
-  2. Standard GEMM   — split + pipelined reduction
-  3. 1D elementwise  — no default values, no annotations (user's real kernel)
+  2. 1D elementwise  — no default values, no annotations
 
 Run:
     python demo_vv_parser.py
 """
 
-import ast
-import inspect
 import os
-import textwrap
-from dataclasses import asdict
-from pprint import pprint
 
 import tilelang.language as T
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
-from tilelang.autotuner.dsl_analysis.vv_param_parser import parse_tl_axis_info
+from tilelang.autotuner.dsl_analysis.vv_param_parser import (
+    parse_tl_axis_info_from_fn,
+    print_vv_axis_parse_result,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -87,24 +84,6 @@ def elementwise_add_1d(M, block_M):
 
 
 # ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-
-def _parse_kernel(fn: object) -> ast.AST:
-    source = textwrap.dedent(inspect.getsource(fn))
-    return ast.parse(source)
-
-
-def _print_result(label: str, result) -> None:
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"  {label}")
-    print(sep)
-    pprint(asdict(result), sort_dicts=False)
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -112,11 +91,13 @@ def _print_result(label: str, result) -> None:
 def main() -> None:
 
     # ── Case 1: 2D elementwise (product-flattened Ascend grid) ────────────
-    result1 = parse_tl_axis_info(
-        _parse_kernel(elementwise_add_2d),
+    result1 = parse_tl_axis_info_from_fn(
+        elementwise_add_2d,
         provided_args={"M": 1024, "N": 1024},
     )
-    _print_result("2D Elementwise  (product-flattened Ascend grid)", result1)
+    print_vv_axis_parse_result(
+        "2D Elementwise  (product-flattened Ascend grid)", result1
+    )
 
     assert result1.status == "ok"
     assert result1.axis_count == 2
@@ -126,11 +107,13 @@ def main() -> None:
     assert result1.reduction_axes == []
 
     # ── Case 2: 1D elementwise (no default, no annotation) ────────────────
-    result2 = parse_tl_axis_info(
-        _parse_kernel(elementwise_add_1d),
+    result2 = parse_tl_axis_info_from_fn(
+        elementwise_add_1d,
         provided_args={"M": 2048},
     )
-    _print_result("1D Elementwise  (no default, no annotation on block_M)", result2)
+    print_vv_axis_parse_result(
+        "1D Elementwise  (no default, no annotation on block_M)", result2
+    )
 
     assert result2.status == "ok"
     assert result2.axis_count == 1

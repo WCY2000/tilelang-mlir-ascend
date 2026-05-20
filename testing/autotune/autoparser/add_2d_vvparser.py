@@ -1,12 +1,14 @@
-import ast
-import inspect
-import textwrap
 import os
 
 import tilelang.language as T
+
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
-from tilelang.autotuner.vv_parser import parse_tilelang_axes
+from tilelang.autotuner.dsl_analysis.vv_param_parser import (
+    parse_tl_axis_info_from_fn,
+    print_vv_axis_parse_result,
+)
+
 
 # ── 1. Get the raw function AST ───────────────────────────────────────────────
 def elementwise_add_kernel(M, N, block_M, block_N):
@@ -24,27 +26,17 @@ def elementwise_add_kernel(M, N, block_M, block_N):
             bx = cid % T.ceildiv(N, block_N)
             A_shared = T.alloc_shared((block_M, block_N), "float16")
             B_shared = T.alloc_shared((block_M, block_N), "float16")
-            C_local  = T.alloc_fragment((block_M, block_N), "float16")
+            C_local = T.alloc_fragment((block_M, block_N), "float16")
             T.copy(A[by * block_M, bx * block_N], A_shared)
             T.copy(B[by * block_M, bx * block_N], B_shared)
             T.vadd(A_shared, B_shared, C_local)
             T.copy(C_local, C[by * block_M, bx * block_N])
+
     return elemAdd
 
-# ── 2. Parse — no keys or candidates needed ───────────────────────────────────
-source   = textwrap.dedent(inspect.getsource(elementwise_add_kernel))
-func_ast = ast.parse(source)
 
-result = parse_tilelang_axes(func_ast)
+# ── 2. Parse — no keys or candidates needed ───────────────────────────────────
+result = parse_tl_axis_info_from_fn(elementwise_add_kernel)
 
 # ── 3. Results ────────────────────────────────────────────────────────────────
-print("Status:         ", result.status)
-print("Inferred keys:  ", result.inferred_keys)   # auto-discovered axis→size map
-print("Split params:   ", result.split_params)    # replaces SplitAxesParser
-print("Tiling params:  ", result.tiling_params)   # replaces TilingAxesParser
-print("Reduction axes: ", result.reduction_axes)  # replaces ReductionAxesParser
-print("Low dim axes:   ", result.low_dim_axes)    # replaces LowDimsAxesParser
-print("Buffer count:   ", result.buf_count)       # replaces BufferNumsParser
-print("Buffer params:  ", result.buffer_params)
-if result.diagnostics:
-    print("Diagnostics:    ", result.diagnostics)
+print_vv_axis_parse_result("VV parser output", result)

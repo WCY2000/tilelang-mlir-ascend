@@ -1,23 +1,20 @@
-import ast
 import inspect
 import os
-import textwrap
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import torch
 import tilelang
 import tilelang.language as T
 from tilelang import carver
+from tilelang.autotuner.dsl_analysis.vv_param_parser import (
+    parse_tl_axis_info_from_fn,
+    print_vv_axis_parse_result,
+)
 from tilelang.carver.arch.ascend import Ascend
-from tilelang.autotuner.dsl_analysis.vv_param_parser import parse_tl_axis_info
-from dataclasses import asdict
-from pprint import pprint
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
-# torch.npu.set_device(15)
-
 SHAPES = [
     (8, 64),
     (8, 128),
@@ -32,75 +29,11 @@ SHAPES = [
     # (1024, 1048576),
 ]
 
-def _parse_kernel(fn: object) -> ast.AST:
-    source = textwrap.dedent(inspect.getsource(fn))
-    return ast.parse(source)
-
-
-def _print_result(label: str, result) -> None:
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"  {label}")
-    print(sep)
-    pprint(asdict(result), sort_dicts=False)
-
-
-# ---------------------------------------------------------------------------
-# Helper: get a clean AST from a (possibly tilelang-decorated) function
-# ---------------------------------------------------------------------------
-
-def _vv_func_ast(fn) -> ast.AST:
-    """
-    Return a parseable AST of *fn*, stripping ``@decorator`` lines.
-
-    Handles three cases:
-      - Plain Python function                        → use directly
-      - After ``@tilelang.jit``   (has __jit_impl__) → unwrap to .func
-      - After ``@tilelang.autotune`` (AutoTuneImpl)  → unwrap to .jit_impl.func
-    """
-    raw_fn = fn
-
-    # Unwrap tilelang decorators to reach the original Python function
-    if hasattr(fn, "jit_impl") and hasattr(fn.jit_impl, "func"):
-        # AutoTuneImpl (after @autotune wrapping @jit)
-        raw_fn = fn.jit_impl.func
-    elif hasattr(fn, "__jit_impl__") and hasattr(fn.__jit_impl__, "func"):
-        # Wrapper function returned by @jit (before @autotune)
-        raw_fn = fn.__jit_impl__.func
-    elif hasattr(fn, "__wrapped__"):
-        raw_fn = fn.__wrapped__
-
-    src = textwrap.dedent(inspect.getsource(raw_fn))
-
-    # Strip @decorator lines so ast.parse only sees the def block
-    lines = src.splitlines()
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith("def "):
-            src = textwrap.dedent("\n".join(lines[i:]))
-            break
-
-    return ast.parse(src)
-
-
-def _print_vv(vv) -> None:
-    print("\n── VV Parser ─────────────────────────────────────────────────")
-    print(f"  Status:         {vv.status}")
-    print(f"  Inferred keys:  {vv.inferred_keys}")
-    print(f"  Split params:   {vv.split_params}")
-    print(f"  Tiling params:  {vv.tiling_params}")
-    print(f"  Reduction axes: {vv.reduction_axes}")
-    print(f"  Low dim axes:   {vv.low_dim_axes}")
-    print(f"  Axis pid dims:  {vv.axis_pid_dims}")
-    print(f"  Buf count:      {vv.buf_count}")
-    print(f"  Buffer params:  {vv.buffer_params}")
-    if vv.diagnostics:
-        print(f"  Diagnostics:    {vv.diagnostics}")
-    print("──────────────────────────────────────────────────────────────")
-
 
 # ---------------------------------------------------------------------------
 # Main test runner
 # ---------------------------------------------------------------------------
+
 
 def run_single_shape(shape, log_dir: Path):
     tilelang.cache.clear_cache()
@@ -128,10 +61,12 @@ def run_single_shape(shape, log_dir: Path):
                 configs = []
                 for hint in hints:
                     print("Hint:", hint)
-                    configs.append({
-                        "block_M": hint.block[0],
-                        "block_N": hint.block[1],
-                    })
+                    configs.append(
+                        {
+                            "block_M": hint.block[0],
+                            "block_N": hint.block[1],
+                        }
+                    )
                 return configs
 
             def supply_prog(params):
@@ -161,26 +96,16 @@ def run_single_shape(shape, log_dir: Path):
                         is_npu=True,
                     ) as (cid, _):
                         by = cid // T.ceildiv(N, block_N)
-                        bx = cid %  T.ceildiv(N, block_N)
+                        bx = cid % T.ceildiv(N, block_N)
                         A_shared = T.alloc_shared((block_M, block_N), "float16")
                         B_shared = T.alloc_shared((block_M, block_N), "float16")
-                        C_local  = T.alloc_fragment((block_M, block_N), "float16")
+                        C_local = T.alloc_fragment((block_M, block_N), "float16")
                         T.copy(A[by * block_M, bx * block_N], A_shared)
                         T.copy(B[by * block_M, bx * block_N], B_shared)
                         T.vadd(A_shared, B_shared, C_local)
                         T.copy(C_local, C[by * block_M, bx * block_N])
-                return elemAdd
 
-            # ── VV Parser ──────────────────────────────────────────────
-            # try:
-            #     vv = parse_tilelang_axes(
-            #         _vv_func_ast(elementwise_add),
-            #         provided_args={"M": M, "N": N},
-            #     )
-            #     _print_vv(vv)
-            # except Exception:
-            #     print("\n[VV Parser] failed to analyse kernel:")
-            #     traceback.print_exc()
+                return elemAdd
 
             # ── Autotune ───────────────────────────────────────────────
             func = elementwise_add(M, N)
@@ -190,20 +115,20 @@ def run_single_shape(shape, log_dir: Path):
                 for (name, val) in zip(
                     inspect.signature(elementwise_add.jit_impl.func).parameters,
                     key_args,
+                    strict=False,
                 )
             }
             print("<<<<< provided_args", provided_args)
-            vv = parse_tl_axis_info(
-                    _vv_func_ast(elementwise_add),
-                    provided_args=provided_args,
-                )
-
+            vv = parse_tl_axis_info_from_fn(
+                elementwise_add,
+                provided_args=provided_args,
+            )
 
             print("\nBest Config:")
             print(func.get_tuner_result())
             print("\nTest passed!")
 
-            _print_result("vv parser output", vv)
+            print_vv_axis_parse_result("VV parser output", vv)
 
         except Exception:
             print("\nERROR OCCURRED\n")
