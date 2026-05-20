@@ -11,7 +11,9 @@ import tilelang
 import tilelang.language as T
 from tilelang import carver
 from tilelang.carver.arch.ascend import Ascend
-from tilelang.autotuner.vv_parser import parse_tilelang_axes
+from tilelang.autotuner.dsl_analysis.vv_param_parser import parse_tl_axis_info
+from dataclasses import asdict
+from pprint import pprint
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 # torch.npu.set_device(15)
@@ -29,6 +31,18 @@ SHAPES = [
     # (1024, 22528),
     # (1024, 1048576),
 ]
+
+def _parse_kernel(fn: object) -> ast.AST:
+    source = textwrap.dedent(inspect.getsource(fn))
+    return ast.parse(source)
+
+
+def _print_result(label: str, result) -> None:
+    sep = "=" * 60
+    print(f"\n{sep}")
+    print(f"  {label}")
+    print(sep)
+    pprint(asdict(result), sort_dicts=False)
 
 
 # ---------------------------------------------------------------------------
@@ -179,15 +193,17 @@ def run_single_shape(shape, log_dir: Path):
                 )
             }
             print("<<<<< provided_args", provided_args)
-            vv = parse_tilelang_axes(
+            vv = parse_tl_axis_info(
                     _vv_func_ast(elementwise_add),
                     provided_args=provided_args,
                 )
-            _print_vv(vv)
+
 
             print("\nBest Config:")
             print(func.get_tuner_result())
             print("\nTest passed!")
+
+            _print_result("vv parser output", vv)
 
         except Exception:
             print("\nERROR OCCURRED\n")
