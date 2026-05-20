@@ -326,7 +326,6 @@ def _extract_ceildiv_numerator_param_names(
     for node in ast.walk(func_ast):
         if not _is_ceildiv(node):
             continue
-        # Walk every Name inside the numerator expression
         for child in ast.walk(node.args[0]):
             if isinstance(child, ast.Name) and child.id in all_param_names:
                 names.add(child.id)
@@ -429,6 +428,10 @@ def _build_tl_signature(
     #
     # This prevents M from being classified as TUNABLE (autotuner target) when
     # no concrete value is supplied — M is a runtime shape, not a tile-size knob.
+    #
+    # _extract_shape_param_names also covers params like N that only appear in
+    # T.Tensor / alloc shapes but never in any T.ceildiv numerator (e.g. a pure
+    # reduction dimension that is not tiled).
     problem_dim_params = _extract_ceildiv_numerator_param_names(
         func_node, all_param_names
     ) | _extract_shape_param_names(func_node, all_param_names)
@@ -480,7 +483,7 @@ def _resolve_tunable_params(
     missing = all_params - provided
 
     ceildiv_divisors = _extract_ceildiv_divisor_names(func_node)
-    tunable = (missing & ceildiv_divisors) if ceildiv_divisors else missing
+    tunable = {p for p in missing if p in ceildiv_divisors} or missing
 
     if hints:
         for item in hints.get("tunable_parameter", []):
@@ -894,16 +897,34 @@ def _extract_alloc_shape_axes(
     return result
 
 
-def _literal_reduce_dims(node: ast.AST) -> List[int]:
-    if isinstance(node, ast.Constant) and isinstance(node.value, int):
-        return [node.value]
+def _parse_dims_node(node: ast.AST) -> Optional[List[int]]:
+    """
+    Parse a ``dims`` AST node into a list of integer dimension indices.
+
+    ``dims`` is always a list/tuple (e.g. ``dims=[1]`` or ``dims=(0, 1)``).
+    A bare integer literal (``dims=1``) is also accepted for robustness,
+    since Python allows passing a single int where a sequence is expected
+    and user code sometimes does this.
+
+    Returns ``None`` when the node cannot be statically resolved to integers
+    (e.g. a variable reference), so callers can distinguish "not found" from
+    "found but empty".
+    """
+    # list/tuple literal: dims=[1] or dims=(0, 1)
     if isinstance(node, (ast.Tuple, ast.List)):
         dims: List[int] = []
         for elt in node.elts:
-            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
-                dims.append(elt.value)
+            if not (isinstance(elt, ast.Constant) and isinstance(elt.value, int)):
+                return None  # non-literal element — bail out
+            dims.append(elt.value)
         return dims
-    return []
+
+    # bare integer literal: dims=1 (robustness only; API expects list/tuple)
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return [node.value]
+
+    # anything else (variable, expression, …) — cannot resolve statically
+    return None
 
 
 def _extract_reduce_call_evidence(
@@ -912,11 +933,26 @@ def _extract_reduce_call_evidence(
     ceildiv_alias_map: Dict[str, Tuple[str, str]],
 ) -> List[_ReductionCallEvidence]:
     """
-    Extract reduction axes from T.reduce input buffer shape and dims.
+    Extract reduction axes from ``T.reduce`` call sites.
 
-    Example: ``A_shared = T.alloc_shared((block_M, N), ...)`` followed by
-    ``T.reduce(A_shared, B_local, dims=1, ...)`` marks ``N`` as a reduction
-    axis.
+    Strategy
+    --------
+    For each ``T.reduce(src, dst, dims=..., ...)`` call:
+
+    1. Look up ``src`` in the alloc-shape map to get its logical axis list.
+    2. Parse the ``dims`` argument to find which dimension indices are reduced.
+    3. Map each reduced dimension index to its logical axis name.
+
+    ``dims`` is always passed as a list/tuple per the API contract; we use
+    ``_parse_dims_node`` which returns ``None`` when the value cannot be
+    resolved statically, letting us distinguish "dims keyword not present"
+    from "dims resolved to an empty list".
+
+    Example::
+
+        A_shared = T.alloc_shared((block_M, N), "float16")
+        T.reduce(A_shared, B_local, dims=[1], reduce_mode="sum", clear=True)
+        # input_axes = ["M", "N"],  dims=[1]  →  reduction axis = "N"
     """
     alloc_shape_axes = _extract_alloc_shape_axes(
         func_ast, param_to_axis, ceildiv_alias_map
@@ -933,13 +969,19 @@ def _extract_reduce_call_evidence(
         if not input_axes:
             continue
 
-        dims: List[int] = []
+        # Locate the dims argument: keyword form first, then positional (index 2).
+        # Use None as sentinel to distinguish "not found" from "found but empty".
+        dims: Optional[List[int]] = None
         for kw in node.keywords:
             if kw.arg == "dims":
-                dims = _literal_reduce_dims(kw.value)
+                dims = _parse_dims_node(kw.value)
                 break
-        if not dims and len(node.args) >= 3:
-            dims = _literal_reduce_dims(node.args[2])
+        if dims is None and len(node.args) >= 3:
+            dims = _parse_dims_node(node.args[2])
+
+        # Skip this call site if dims could not be resolved statically.
+        if dims is None:
+            continue
 
         for dim in dims:
             dim_idx = dim if dim >= 0 else len(input_axes) + dim
@@ -1098,6 +1140,7 @@ def parse_tl_axis_semantic(
     #    Rules:
     #      ceildiv divisors  (block_M, block_K)  → is_constexpr=True → TUNABLE
     #      ceildiv numerators (M, N, K)           → is_constexpr=True → FIXED_COMPILE_TIME
+    #      shape-only params (N in alloc/Tensor)  → is_constexpr=True → FIXED_COMPILE_TIME
     #      unrelated params  (num_stages,threads) → is_constexpr=False → RUNTIME_NON_TUNABLE
     #
     #    classify_length_symbol gates the provided_args lookup behind is_constexpr,
@@ -1107,7 +1150,7 @@ def parse_tl_axis_semantic(
     # 4. Ceildiv alias map
     ceildiv_alias_map = _build_ceildiv_alias_map(func_node)
 
-    # 5. Split evidence (T.Kernel grid args)
+    # 5. Split evidence (T.Kernel grid args) extract T.ceildiv(M, block_M) , T.ceildiv(M,bM) * T.ceildiv(N,bN),floor-div (M+bM-1)//bM
     split_evidences = _extract_split_evidence(
         func_node, tunable_params, ceildiv_alias_map
     )
@@ -1117,7 +1160,7 @@ def parse_tl_axis_semantic(
         func_node, tunable_params, ceildiv_alias_map
     )
 
-    # 7. param → axis mapping (for low-dim extraction)
+    # 7. param → axis mapping (for low-dim and T.reduce extraction)
     param_to_axis: Dict[str, str] = {}
     for ev in split_evidences:
         param_to_axis.setdefault(ev.param_name, ev.axis_name)
@@ -1133,7 +1176,8 @@ def parse_tl_axis_semantic(
     )
     low_dim_set = set(low_dim_axes_list)
 
-    # 9. Ordered unique axis list: split axes (by pid_dim), then tiling-only
+    # 9. Ordered unique axis list: split axes (by pid_dim), then tiling-only,
+    #    then T.reduce-only axes (e.g. a pure reduction dim with no for loop).
     ordered_axes: List[str] = []
     seen_axes: Set[str] = set()
 
@@ -1169,7 +1213,7 @@ def parse_tl_axis_semantic(
             reduction_axes=[],
             status="failed",
             diagnostics=diagnostics
-            + ["no axis information resolved from T.Kernel / T.Pipelined / range"],
+            + ["no axis information resolved from T.Kernel / T.Pipelined / range / T.reduce"],
         )
 
     # 10. Aggregate dicts
@@ -1191,6 +1235,9 @@ def parse_tl_axis_semantic(
     reduce_call_ev_map: Dict[str, _ReductionCallEvidence] = {
         ev.axis_name: ev for ev in reduce_call_evidences
     }
+
+    # Build reduction_axes list: loop-based evidence first, T.reduce evidence second.
+    # Both sources share seen_red to avoid duplicates.
     reduction_axes_list: List[str] = []
     seen_red: Set[str] = set()
     for ev in tiling_evidences:
