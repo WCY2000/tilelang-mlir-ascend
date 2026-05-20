@@ -333,6 +333,34 @@ def _extract_ceildiv_numerator_param_names(
     return names
 
 
+def _extract_shape_param_names(
+    func_ast: ast.AST,
+    all_param_names: Set[str],
+) -> Set[str]:
+    """Return function parameters that appear in T.Tensor / alloc shapes."""
+    names: Set[str] = set()
+
+    def _collect_from_shape(shape_node: ast.AST) -> None:
+        for child in ast.walk(shape_node):
+            if isinstance(child, ast.Name) and child.id in all_param_names:
+                names.add(child.id)
+
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not (
+            isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "T"
+            and node.func.attr in ("Tensor", "Buffer", *_ALLOC_CALLS)
+        ):
+            continue
+        if node.args:
+            _collect_from_shape(node.args[0])
+
+    return names
+
+
 # ---------------------------------------------------------------------------
 # TileLang-specific signature builder
 # ---------------------------------------------------------------------------
@@ -403,7 +431,7 @@ def _build_tl_signature(
     # no concrete value is supplied — M is a runtime shape, not a tile-size knob.
     problem_dim_params = _extract_ceildiv_numerator_param_names(
         func_node, all_param_names
-    )
+    ) | _extract_shape_param_names(func_node, all_param_names)
     provided_keys = set(provided_args.keys())
     provided_problem_dims = problem_dim_params & provided_keys
 
@@ -515,6 +543,13 @@ class _TilingEvidence:
     axis_total_expr: str
     loop_var: Optional[str] = None
     source: str = "T.Pipelined"
+    confidence: float = 0.90
+
+
+@dataclass
+class _ReductionCallEvidence:
+    axis_name: str
+    source: str = "T.reduce"
     confidence: float = 0.90
 
 
@@ -820,6 +855,105 @@ def _extract_tiling_evidence(
 
 
 # ---------------------------------------------------------------------------
+# T.reduce reduction-axis extraction
+# ---------------------------------------------------------------------------
+
+
+def _extract_alloc_shape_axes(
+    func_ast: ast.AST,
+    param_to_axis: Dict[str, str],
+    ceildiv_alias_map: Dict[str, Tuple[str, str]],
+) -> Dict[str, List[Optional[str]]]:
+    """Return local buffer name → logical axis list for T.alloc_* shapes."""
+    result: Dict[str, List[Optional[str]]] = {}
+
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not (len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)):
+            continue
+        call = node.value
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "T"
+            and call.func.attr in _ALLOC_CALLS
+        ):
+            continue
+        if not call.args:
+            continue
+        shape_arg = call.args[0]
+        if not isinstance(shape_arg, (ast.Tuple, ast.List)):
+            continue
+        result[node.targets[0].id] = [
+            _shape_elt_to_axis(elt, param_to_axis, ceildiv_alias_map)
+            for elt in shape_arg.elts
+        ]
+
+    return result
+
+
+def _literal_reduce_dims(node: ast.AST) -> List[int]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int):
+        return [node.value]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        dims: List[int] = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, int):
+                dims.append(elt.value)
+        return dims
+    return []
+
+
+def _extract_reduce_call_evidence(
+    func_ast: ast.AST,
+    param_to_axis: Dict[str, str],
+    ceildiv_alias_map: Dict[str, Tuple[str, str]],
+) -> List[_ReductionCallEvidence]:
+    """
+    Extract reduction axes from T.reduce input buffer shape and dims.
+
+    Example: ``A_shared = T.alloc_shared((block_M, N), ...)`` followed by
+    ``T.reduce(A_shared, B_local, dims=1, ...)`` marks ``N`` as a reduction
+    axis.
+    """
+    alloc_shape_axes = _extract_alloc_shape_axes(
+        func_ast, param_to_axis, ceildiv_alias_map
+    )
+    results: List[_ReductionCallEvidence] = []
+    seen_axes: Set[str] = set()
+
+    for node in ast.walk(func_ast):
+        if not _is_t_call(node, "reduce"):
+            continue
+        if not node.args or not isinstance(node.args[0], ast.Name):
+            continue
+        input_axes = alloc_shape_axes.get(node.args[0].id)
+        if not input_axes:
+            continue
+
+        dims: List[int] = []
+        for kw in node.keywords:
+            if kw.arg == "dims":
+                dims = _literal_reduce_dims(kw.value)
+                break
+        if not dims and len(node.args) >= 3:
+            dims = _literal_reduce_dims(node.args[2])
+
+        for dim in dims:
+            dim_idx = dim if dim >= 0 else len(input_axes) + dim
+            if dim_idx < 0 or dim_idx >= len(input_axes):
+                continue
+            axis = input_axes[dim_idx]
+            if axis and axis not in seen_axes:
+                seen_axes.add(axis)
+                results.append(_ReductionCallEvidence(axis_name=axis))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Low-dim extraction
 # ---------------------------------------------------------------------------
 
@@ -990,7 +1124,10 @@ def parse_tl_axis_semantic(
     for ev in tiling_evidences:
         param_to_axis.setdefault(ev.param_name, ev.axis_name)
 
-    # 8. Low-dim axes
+    # 8. T.reduce reduction axes and low-dim axes
+    reduce_call_evidences = _extract_reduce_call_evidence(
+        func_node, param_to_axis, ceildiv_alias_map
+    )
     low_dim_axes_list = _extract_low_dim_axes(
         func_node, param_to_axis, ceildiv_alias_map
     )
@@ -1010,6 +1147,11 @@ def parse_tl_axis_semantic(
                 seen_axes.add(ax)
 
     for ev in tiling_evidences:
+        if ev.axis_name not in seen_axes:
+            ordered_axes.append(ev.axis_name)
+            seen_axes.add(ev.axis_name)
+
+    for ev in reduce_call_evidences:
         if ev.axis_name not in seen_axes:
             ordered_axes.append(ev.axis_name)
             seen_axes.add(ev.axis_name)
@@ -1046,10 +1188,17 @@ def parse_tl_axis_semantic(
     tiling_ev_map: Dict[str, _TilingEvidence] = {
         ev.axis_name: ev for ev in tiling_evidences
     }
+    reduce_call_ev_map: Dict[str, _ReductionCallEvidence] = {
+        ev.axis_name: ev for ev in reduce_call_evidences
+    }
     reduction_axes_list: List[str] = []
     seen_red: Set[str] = set()
     for ev in tiling_evidences:
         if ev.is_reduction and ev.axis_name not in seen_red:
+            reduction_axes_list.append(ev.axis_name)
+            seen_red.add(ev.axis_name)
+    for ev in reduce_call_evidences:
+        if ev.axis_name not in seen_red:
             reduction_axes_list.append(ev.axis_name)
             seen_red.add(ev.axis_name)
 
@@ -1073,6 +1222,7 @@ def parse_tl_axis_semantic(
             inferred_keys[axis_name] = extent.expr
 
         tev = tiling_ev_map.get(axis_name)
+        rev = reduce_call_ev_map.get(axis_name)
         is_reduction = axis_name in seen_red
 
         axes[axis_name] = AxisSemanticInfo(
@@ -1089,10 +1239,12 @@ def parse_tl_axis_semantic(
                 loop_var=tev.loop_var if tev else None,
                 source=tev.source
                 if tev
-                else ("T.Pipelined" if is_reduction else "range"),
+                else (
+                    rev.source if rev else ("T.Pipelined" if is_reduction else "range")
+                ),
                 confidence=tev.confidence
                 if (tev and axis_name in tiling_params)
-                else 0.0,
+                else (rev.confidence if rev else 0.0),
                 fixed_expr=None,
             ),
             is_low_dim=(axis_name in low_dim_set),
