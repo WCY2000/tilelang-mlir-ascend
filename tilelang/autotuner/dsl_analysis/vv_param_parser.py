@@ -659,6 +659,26 @@ def _extract_split_evidence_from_kernel(
     return results
 
 
+def _is_linearized_single_dim_kernel(func_ast: ast.AST) -> bool:
+    """
+    Return true when T.Kernel has one physical grid arg without T.ceildiv.
+
+    Constant-core kernels such as ``T.Kernel(num_physical_kernels, ...)``
+    decode all logical axes from one linearized pid.  Fallback evidence found
+    in the body should therefore keep ``pid_dim=0`` for every recovered axis.
+    """
+    for node in ast.walk(func_ast):
+        if not isinstance(node, ast.Call):
+            continue
+        if not _is_t_attr(node.func, "Kernel"):
+            continue
+        if len(node.args) != 1:
+            continue
+        if not any(_is_ceildiv(child) for child in ast.walk(node.args[0])):
+            return True
+    return False
+
+
 def _fallback_split_scan(
     func_ast: ast.AST,
     tunable_params: Set[str],
@@ -673,6 +693,7 @@ def _fallback_split_scan(
     """
     results: List[_SplitEvidence] = []
     seen_params: Set[str] = already_found.copy()
+    is_linearized_single_dim = _is_linearized_single_dim_kernel(func_ast)
     dim_counter = 0
 
     for node in ast.walk(func_ast):
@@ -692,11 +713,12 @@ def _fallback_split_scan(
         if param_text not in tunable_params or param_text in seen_params:
             continue
         seen_params.add(param_text)
+        assigned_dim = 0 if is_linearized_single_dim else dim_counter
         results.append(
             _SplitEvidence(
                 axis_name=axis_text,
                 param_name=param_text,
-                pid_dim=dim_counter,
+                pid_dim=assigned_dim,
                 axis_total_expr=axis_text,
                 source="fallback_divmod",
                 confidence=0.75,
@@ -715,11 +737,12 @@ def _fallback_split_scan(
             continue
         param_text = node.right.id
         seen_params.add(param_text)
+        assigned_dim = 0 if is_linearized_single_dim else dim_counter
         results.append(
             _SplitEvidence(
                 axis_name=_ast_to_text(node.left),
                 param_name=param_text,
-                pid_dim=dim_counter,
+                pid_dim=assigned_dim,
                 axis_total_expr=_ast_to_text(node.left),
                 source="fallback_floordiv",
                 confidence=0.60,
@@ -1213,7 +1236,9 @@ def parse_tl_axis_semantic(
             reduction_axes=[],
             status="failed",
             diagnostics=diagnostics
-            + ["no axis information resolved from T.Kernel / T.Pipelined / range / T.reduce"],
+            + [
+                "no axis information resolved from T.Kernel / T.Pipelined / range / T.reduce"
+            ],
         )
 
     # 10. Aggregate dicts
