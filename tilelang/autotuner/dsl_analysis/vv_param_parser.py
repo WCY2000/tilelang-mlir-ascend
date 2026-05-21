@@ -1435,7 +1435,7 @@ def parse_tl_axis_info(
         entry_function_name=entry_function_name,
     )
 
-    ordered_axis_names = list(semantic_result.axes.keys())
+    ordered_axis_names = sorted(semantic_result.axes.keys(), key=_axis_sort_key)
     legacy_axes: List[VvAxisInfoV2] = []
     axis_dynamic_sources: Dict[str, str] = {}
 

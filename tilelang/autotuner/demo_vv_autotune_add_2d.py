@@ -36,7 +36,7 @@ SHAPES = [
 
 
 def run_single_shape(shape, log_dir: Path):
-    tilelang.cache.clear_cache()
+    # tilelang.cache.clear_cache()
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "log.log"
 
@@ -138,7 +138,7 @@ def run_single_shape(shape, log_dir: Path):
 
 
 def main():
-    root_log_dir = Path("./shape_logs_2d")
+    root_log_dir = Path("./add_shape_logs_2d")
     root_log_dir.mkdir(exist_ok=True)
     for shape in SHAPES:
         shape_str = "x".join(map(str, shape))

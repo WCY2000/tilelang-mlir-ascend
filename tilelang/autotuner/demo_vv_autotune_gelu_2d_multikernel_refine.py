@@ -14,26 +14,25 @@ from tilelang.autotuner.dsl_analysis.vv_param_parser import (
 )
 from tilelang.carver.arch.ascend import Ascend
 
-torch.npu.set_device(15)
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
 SHAPES = [
     (8, 64),
     (8, 128),
-    (8, 2048),
-    (8, 127),
-    (16, 255),
-    (32, 1025),
-    (1024, 10240),
-    (1024, 14336),
-    (1024, 18432),
-    (1024, 22528),
-    (1024, 1048576),
+    # (8, 2048),
+    # (8, 127),
+    # (16, 255),
+    # (32, 1025),
+    # (1024, 10240),
+    # (1024, 14336),
+    # (1024, 18432),
+    # (1024, 22528),
+    # (1024, 1048576),
 ]
 
 
 def run_single_shape(shape, log_dir: Path):
-    tilelang.cache.clear_cache()
+    # tilelang.cache.clear_cache()
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "log.log"
@@ -153,7 +152,7 @@ def run_single_shape(shape, log_dir: Path):
 
 
 def main():
-    root_log_dir = Path("./shape_logs_2d_f32_new")
+    root_log_dir = Path("./gelu_shape_logs_2d_multikernel")
     root_log_dir.mkdir(exist_ok=True)
 
     for shape in SHAPES:
