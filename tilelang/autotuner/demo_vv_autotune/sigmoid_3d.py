@@ -14,22 +14,21 @@ from tilelang.autotuner.dsl_analysis.vv_param_parser import (
 )
 from tilelang.carver.arch.ascend import Ascend
 
-torch.npu.set_device(15)
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
 SHAPES = [
     (1, 32, 64),
     (1, 32, 128),
-    (1, 32, 2048),
-    (1, 22, 127),
-    (1, 44, 255),
-    (1, 88, 1025),
-    (32, 1632, 1025),
+    # (1, 32, 2048),
+    # (1, 22, 127),
+    # (1, 44, 255),
+    # (1, 88, 1025),
+    # (32, 1632, 1025),
 ]
 
 
 def run_single_shape(shape, log_dir: Path):
-    tilelang.cache.clear_cache()
+    # tilelang.cache.clear_cache()
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "log.log"
@@ -43,14 +42,14 @@ def run_single_shape(shape, log_dir: Path):
             B, M, N = shape
 
             def ref_prog(x):
-                return x * 0.5 * (1.0 + torch.erf(x / torch.sqrt(torch.tensor(2.0))))
+                return torch.sigmoid(x)
 
             def get_config():
                 arch = Ascend()
 
                 carver_template = carver.ElementwiseTemplate(
                     shape=[B, M, N],
-                    dtype="float32",
+                    dtype="float16",
                 ).with_arch(arch)
 
                 hints = carver_template.recommend_hints(topk=20)
@@ -91,8 +90,7 @@ def run_single_shape(shape, log_dir: Path):
             def supply_prog(params):
                 torch.manual_seed(0)
                 return [
-                    torch.empty(B, M, N).uniform_(-1.0, 1.0).npu(),
-                    # torch.randn(B, M, N).half().npu(),
+                    torch.randn(B, M, N, dtype=torch.float16).npu(),
                 ]
 
             @tilelang.autotune(
@@ -103,12 +101,12 @@ def run_single_shape(shape, log_dir: Path):
                 rtol=1e-2,
             )
             @tilelang.jit(out_idx=[-1], target="npuir")
-            def compute_gelu(B, M, N, block_B, block_M, block_N):
+            def compute_sigmoid(B, M, N, block_B, block_M, block_N):
 
                 @T.prim_func
-                def gelu_3D(
-                    A: T.Tensor((B, M, N), "float32"),
-                    B_out: T.Tensor((B, M, N), "float32"),
+                def sigmoid_3D(
+                    A: T.Tensor((B, M, N), "float16"),
+                    B_out: T.Tensor((B, M, N), "float16"),
                 ):
 
                     with T.Kernel(
@@ -118,64 +116,50 @@ def run_single_shape(shape, log_dir: Path):
                         is_npu=True,
                     ) as (cid, _):
                         tmp = cid
-
                         bz = tmp // (T.ceildiv(M, block_M) * T.ceildiv(N, block_N))
                         tmp = tmp % (T.ceildiv(M, block_M) * T.ceildiv(N, block_N))
 
                         by = tmp // T.ceildiv(N, block_N)
                         bx = tmp % T.ceildiv(N, block_N)
-                        scale1 = 1 / (2.0**0.5)
-                        scale2 = 1.0
-                        scale3 = 0.5
+
                         A_shared = T.alloc_shared(
-                            (block_B, block_M, block_N), "float32"
+                            (block_B, block_M, block_N), "float16"
                         )
                         B_local = T.alloc_fragment(
-                            (block_B, block_M, block_N), "float32"
+                            (block_B, block_M, block_N), "float16"
                         )
-                        C_local = T.alloc_fragment(
-                            (block_B, block_M, block_N), "float32"
-                        )
-                        D_local = T.alloc_fragment(
-                            (block_B, block_M, block_N), "float32"
-                        )
+
                         T.copy(
                             A[bz * block_B, by * block_M, bx * block_N],
                             A_shared,
                         )
-                        T.vmul(A_shared, scale1, B_local)
-                        T.npuir_verf(B_local, C_local)
-                        T.vadd(C_local, scale2, C_local)
-                        T.vmul(C_local, scale3, C_local)
-                        T.vmul(A_shared, C_local, D_local)
-
+                        T.npuir_sigmoid(A_shared, B_local)
                         T.copy(
-                            D_local,
+                            B_local,
                             B_out[bz * block_B, by * block_M, bx * block_N],
                         )
 
-                return gelu_3D
+                return sigmoid_3D
 
-            func = compute_gelu(B, M, N)
-            key_args, _ = list(compute_gelu._tuner_cache.keys())[-1]
+            func = compute_sigmoid(B, M, N)
+            key_args, _ = list(compute_sigmoid._tuner_cache.keys())[-1]
             provided_args = {
                 name: val
                 for (name, val) in zip(
-                    inspect.signature(compute_gelu.jit_impl.func).parameters,
+                    inspect.signature(compute_sigmoid.jit_impl.func).parameters,
                     key_args,
                     strict=False,
                 )
             }
             print("<<<<< provided_args", provided_args)
             vv = parse_tl_axis_info_from_fn(
-                compute_gelu,
+                compute_sigmoid,
                 provided_args=provided_args,
             )
 
             print("\nBest Config:")
             print(func.get_tuner_result())
             print("\nTest passed!")
-
             print_vv_axis_parse_result("VV parser output", vv)
 
         except Exception:
@@ -186,8 +170,7 @@ def run_single_shape(shape, log_dir: Path):
 
 
 def main():
-    root_log_dir = Path("./shape_logs_3d_f32")
-    root_log_dir.mkdir(exist_ok=True)
+    root_log_dir = Path("./sigmoid_shape_logs_3d")
 
     for shape in SHAPES:
         shape_str = "x".join(map(str, shape))

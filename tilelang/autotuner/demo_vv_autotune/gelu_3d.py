@@ -14,21 +14,16 @@ from tilelang.autotuner.dsl_analysis.vv_param_parser import (
 )
 from tilelang.carver.arch.ascend import Ascend
 
-torch.npu.set_device(15)
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 
-# 4D shape (N, C, H, W)
 SHAPES = [
-    (8, 4, 8, 64),
-    (8, 4, 8, 128),
-    (8, 4, 2048, 8),
-    (8, 4, 8, 127),
-    (16, 8, 16, 255),
+    (1, 32, 64),
+    (1, 32, 128),
 ]
 
 
 def run_single_shape(shape, log_dir: Path):
-    tilelang.cache.clear_cache()
+    # tilelang.cache.clear_cache()
 
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "log.log"
@@ -39,7 +34,7 @@ def run_single_shape(shape, log_dir: Path):
         print("=" * 80)
 
         try:
-            N, C, H, W = shape
+            B, M, N = shape
 
             def ref_prog(x):
                 return x * 0.5 * (1.0 + torch.erf(x / torch.sqrt(torch.tensor(2.0))))
@@ -48,7 +43,7 @@ def run_single_shape(shape, log_dir: Path):
                 arch = Ascend()
 
                 carver_template = carver.ElementwiseTemplate(
-                    shape=[N, C, H, W],
+                    shape=[B, M, N],
                     dtype="float32",
                 ).with_arch(arch)
 
@@ -62,7 +57,7 @@ def run_single_shape(shape, log_dir: Path):
                     blocks = hint.block
                     ndim = len(blocks)
 
-                    shape_dims = [N, C, H, W]
+                    shape_dims = [B, M, N]
                     result_blocks = []
 
                     j = 0
@@ -79,10 +74,9 @@ def run_single_shape(shape, log_dir: Path):
 
                     configs.append(
                         {
-                            "block_N": result_blocks[0],
-                            "block_C": result_blocks[1],
-                            "block_H": result_blocks[2],
-                            "block_W": result_blocks[3],
+                            "block_B": result_blocks[0],
+                            "block_M": result_blocks[1],
+                            "block_N": result_blocks[2],
                         }
                     )
 
@@ -91,8 +85,8 @@ def run_single_shape(shape, log_dir: Path):
             def supply_prog(params):
                 torch.manual_seed(0)
                 return [
-                    torch.empty(N, C, H, W).uniform_(-1.0, 1.0).npu(),
-                    # torch.randn(N, C, H, W).npu(),
+                    torch.empty(B, M, N).uniform_(-1.0, 1.0).npu(),
+                    # torch.randn(B, M, N).half().npu(),
                 ]
 
             @tilelang.autotune(
@@ -103,68 +97,46 @@ def run_single_shape(shape, log_dir: Path):
                 rtol=1e-2,
             )
             @tilelang.jit(out_idx=[-1], target="npuir")
-            def compute_gelu(N, C, H, W, block_N, block_C, block_H, block_W):
+            def compute_gelu(B, M, N, block_B, block_M, block_N):
 
                 @T.prim_func
-                def gelu_4D(
-                    A: T.Tensor((N, C, H, W), "float32"),
-                    B: T.Tensor((N, C, H, W), "float32"),
+                def gelu_3D(
+                    A: T.Tensor((B, M, N), "float32"),
+                    B_out: T.Tensor((B, M, N), "float32"),
                 ):
 
                     with T.Kernel(
-                        T.ceildiv(N, block_N)
-                        * T.ceildiv(C, block_C)
-                        * T.ceildiv(H, block_H)
-                        * T.ceildiv(W, block_W),
+                        T.ceildiv(B, block_B)
+                        * T.ceildiv(M, block_M)
+                        * T.ceildiv(N, block_N),
                         is_npu=True,
                     ) as (cid, _):
                         tmp = cid
 
-                        bz = tmp // (
-                            T.ceildiv(C, block_C)
-                            * T.ceildiv(H, block_H)
-                            * T.ceildiv(W, block_W)
-                        )
-                        tmp %= (
-                            T.ceildiv(C, block_C)
-                            * T.ceildiv(H, block_H)
-                            * T.ceildiv(W, block_W)
-                        )
+                        bz = tmp // (T.ceildiv(M, block_M) * T.ceildiv(N, block_N))
+                        tmp = tmp % (T.ceildiv(M, block_M) * T.ceildiv(N, block_N))
 
-                        bc = tmp // (T.ceildiv(H, block_H) * T.ceildiv(W, block_W))
-                        tmp %= T.ceildiv(H, block_H) * T.ceildiv(W, block_W)
-
-                        by = tmp // T.ceildiv(W, block_W)
-                        bx = tmp % T.ceildiv(W, block_W)
+                        by = tmp // T.ceildiv(N, block_N)
+                        bx = tmp % T.ceildiv(N, block_N)
                         scale1 = 1 / (2.0**0.5)
                         scale2 = 1.0
                         scale3 = 0.5
                         A_shared = T.alloc_shared(
-                            (block_N, block_C, block_H, block_W),
-                            "float32",
+                            (block_B, block_M, block_N), "float32"
                         )
                         B_local = T.alloc_fragment(
-                            (block_N, block_C, block_H, block_W),
-                            "float32",
+                            (block_B, block_M, block_N), "float32"
                         )
                         C_local = T.alloc_fragment(
-                            (block_N, block_C, block_H, block_W),
-                            "float32",
+                            (block_B, block_M, block_N), "float32"
                         )
                         D_local = T.alloc_fragment(
-                            (block_N, block_C, block_H, block_W),
-                            "float32",
+                            (block_B, block_M, block_N), "float32"
                         )
                         T.copy(
-                            A[
-                                bz * block_N,
-                                bc * block_C,
-                                by * block_H,
-                                bx * block_W,
-                            ],
+                            A[bz * block_B, by * block_M, bx * block_N],
                             A_shared,
                         )
-
                         T.vmul(A_shared, scale1, B_local)
                         T.npuir_verf(B_local, C_local)
                         T.vadd(C_local, scale2, C_local)
@@ -173,17 +145,12 @@ def run_single_shape(shape, log_dir: Path):
 
                         T.copy(
                             D_local,
-                            B[
-                                bz * block_N,
-                                bc * block_C,
-                                by * block_H,
-                                bx * block_W,
-                            ],
+                            B_out[bz * block_B, by * block_M, bx * block_N],
                         )
 
-                return gelu_4D
+                return gelu_3D
 
-            func = compute_gelu(N, C, H, W)
+            func = compute_gelu(B, M, N)
             key_args, _ = list(compute_gelu._tuner_cache.keys())[-1]
             provided_args = {
                 name: val
@@ -213,7 +180,7 @@ def run_single_shape(shape, log_dir: Path):
 
 
 def main():
-    root_log_dir = Path("./shape_logs_f32")
+    root_log_dir = Path("./gelu_shape_logs_3d")
     root_log_dir.mkdir(exist_ok=True)
 
     for shape in SHAPES:
