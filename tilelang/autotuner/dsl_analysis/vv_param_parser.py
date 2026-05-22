@@ -74,6 +74,7 @@ TileLang pattern reference
 **Tiling / reduction axes**::
 
     for k in T.Pipelined(T.ceildiv(K, block_K), num_stages=3):
+    for k in T.serial(T.ceildiv(N, block_N)):
     for k in range(T.ceildiv(K, block_K)):
         T.gemm(A_shared, B_shared, C_local)
 
@@ -122,6 +123,11 @@ _CEILDIV_ATTRS: frozenset = frozenset(("ceildiv", "cdiv"))
 _REDUCTION_CALLS: frozenset = frozenset(("gemm", "reduce", "dot", "matmul"))
 _ALLOC_CALLS: frozenset = frozenset(("alloc_shared", "alloc_fragment"))
 _LOOP_RANGE_IDS: frozenset = frozenset(("range", "tl_range"))
+
+# T.* loop calls that represent serial (non-pipelined) tiling loops.
+# T.serial is treated identically to range / tl_range: tiling only,
+# is_reduction determined by whether the body contains a reduction primitive.
+_T_SERIAL_ATTRS: frozenset = frozenset(("serial",))
 
 
 # ---------------------------------------------------------------------------
@@ -421,27 +427,12 @@ def _build_tl_signature(
     param_names = _get_function_param_names(func_node)
     defaults = _get_default_param_names(func_node)
 
-    # Problem-dimension params (ceildiv numerators: M, N, K, …) are
-    # constexpr-equivalent ONLY when they are in provided_args.
-    #   - In provided_args → is_constexpr=True  → FIXED_COMPILE_TIME (value known)
-    #   - NOT in provided_args → is_constexpr=False → RUNTIME_NON_TUNABLE (dynamic shape)
-    #
-    # This prevents M from being classified as TUNABLE (autotuner target) when
-    # no concrete value is supplied — M is a runtime shape, not a tile-size knob.
-    #
-    # _extract_shape_param_names also covers params like N that only appear in
-    # T.Tensor / alloc shapes but never in any T.ceildiv numerator (e.g. a pure
-    # reduction dimension that is not tiled).
     problem_dim_params = _extract_ceildiv_numerator_param_names(
         func_node, all_param_names
     ) | _extract_shape_param_names(func_node, all_param_names)
     provided_keys = set(provided_args.keys())
     provided_problem_dims = problem_dim_params & provided_keys
 
-    # axis_relevant: params that classify_length_symbol should treat as constexpr
-    #   - block params (tunable divisors): always constexpr → TUNABLE
-    #   - provided problem dims:           constexpr       → FIXED_COMPILE_TIME
-    #   - num_stages, threads, etc.:       NOT constexpr   → RUNTIME_NON_TUNABLE
     axis_relevant = tunable_params | provided_problem_dims
 
     parameters = [
@@ -790,6 +781,46 @@ def _body_has_reduction(stmts: List[ast.stmt]) -> bool:
     return False
 
 
+def _is_tiling_loop(iter_node: ast.Call) -> Tuple[bool, bool]:
+    """
+    Classify an ``ast.For`` iterator call node.
+
+    Returns ``(is_tiling_loop, is_pipelined)``:
+
+    * ``is_tiling_loop`` — True when the call is any recognised serial/tiling
+      loop form: ``range``, ``tl_range``, ``T.serial``, or ``T.Pipelined``.
+    * ``is_pipelined`` — True only for ``T.Pipelined``; signals that
+      ``is_reduction`` should be forced True regardless of body content.
+
+    ``T.serial`` is a TileLang-Ascend loop primitive equivalent to ``range``
+    for AST purposes: it produces a serial (non-parallel) tiling loop whose
+    reduction status is determined by whether the loop body calls a reduction
+    primitive (``T.reduce``, ``T.gemm``, …).
+    """
+    is_pipelined = _is_t_call(iter_node, "Pipelined")
+    if is_pipelined:
+        return True, True
+
+    is_plain_range = (
+        isinstance(iter_node.func, ast.Name)
+        and iter_node.func.id in _LOOP_RANGE_IDS
+    )
+    if is_plain_range:
+        return True, False
+
+    # T.serial — treat like range (serial tiling, reduction determined by body)
+    is_t_serial = (
+        isinstance(iter_node.func, ast.Attribute)
+        and iter_node.func.attr in _T_SERIAL_ATTRS
+        and isinstance(iter_node.func.value, ast.Name)
+        and iter_node.func.value.id == "T"
+    )
+    if is_t_serial:
+        return True, False
+
+    return False, False
+
+
 def _extract_loop_bound_info(
     iter_call: ast.Call,
     tunable_params: Set[str],
@@ -828,9 +859,22 @@ def _extract_tiling_evidence(
     """
     Walk ast.For nodes and extract tiling / reduction evidence.
 
-    * T.Pipelined → always reduction (software-pipelined)  confidence 0.90
-    * range / tl_range + T.gemm/reduce/dot in body → reduction  confidence 0.80
-    * range / tl_range without reduction primitive → tiling only  confidence 0.80
+    Recognised loop forms and their reduction classification:
+
+    * ``T.Pipelined(...)``          → always reduction (software-pipelined)
+    * ``T.serial(T.ceildiv(...))``  → reduction if body contains T.reduce/gemm/…
+    * ``range(T.ceildiv(...))``     → reduction if body contains T.reduce/gemm/…
+    * ``tl_range(T.ceildiv(...))``  → reduction if body contains T.reduce/gemm/…
+
+    ``T.serial`` is treated identically to ``range`` / ``tl_range``: it is a
+    plain serial loop — not software-pipelined — so ``is_reduction`` is
+    determined by inspecting the loop body for reduction primitives rather than
+    being forced True.  This correctly classifies the ``N`` axis in::
+
+        for ko in T.serial(T.ceildiv(N, block_N)):
+            T.reduce(A_shared, Out_local, dims=1, reduce_mode="sum")
+
+    as a tiling+reduction axis with ``tiling_params = {"N": "block_N"}``.
 
     Note: ``num_stages`` in ``T.Pipelined(..., num_stages=n)`` is a keyword
     argument and is never confused with a tunable axis parameter because it
@@ -846,12 +890,8 @@ def _extract_tiling_evidence(
         if not isinstance(iter_node, ast.Call):
             continue
 
-        is_pipelined = _is_t_call(iter_node, "Pipelined")
-        is_range = (
-            isinstance(iter_node.func, ast.Name)
-            and iter_node.func.id in _LOOP_RANGE_IDS
-        )
-        if not (is_pipelined or is_range):
+        is_tiling, is_pipelined = _is_tiling_loop(iter_node)
+        if not is_tiling:
             continue
 
         info = _extract_loop_bound_info(iter_node, tunable_params, ceildiv_alias_map)
@@ -865,6 +905,8 @@ def _extract_tiling_evidence(
         is_reduction = is_pipelined or _body_has_reduction(node.body)
         loop_var = node.target.id if isinstance(node.target, ast.Name) else None
 
+        source = "T.Pipelined" if is_pipelined else "range"
+
         results.append(
             _TilingEvidence(
                 axis_name=axis_total_expr,
@@ -872,7 +914,7 @@ def _extract_tiling_evidence(
                 is_reduction=is_reduction,
                 axis_total_expr=axis_total_expr,
                 loop_var=loop_var,
-                source="T.Pipelined" if is_pipelined else "range",
+                source=source,
                 confidence=0.90 if is_pipelined else 0.80,
             )
         )
@@ -888,9 +930,17 @@ def _extract_tiling_evidence(
 def _extract_alloc_shape_axes(
     func_ast: ast.AST,
     param_to_axis: Dict[str, str],
-    ceildiv_alias_map: Dict[str, Tuple[str, str]],
+    celdiv_alias_map: Dict[str, Tuple[str, str]],
+    tunable_params: Optional[Set[str]] = None,
 ) -> Dict[str, List[Optional[str]]]:
-    """Return local buffer name → logical axis list for T.alloc_* shapes."""
+    """Return local buffer name → logical axis list for T.alloc_* shapes.
+
+    ``tunable_params`` is used to skip block-size params (``block_N``,
+    ``block_K``, …) that are tile-size knobs rather than axis names.
+    When a shape element resolves to a tunable param that has no entry in
+    ``param_to_axis`` yet (i.e. the tiling evidence has not yet been built),
+    ``None`` is stored for that dimension so callers can detect unmapped dims.
+    """
     result: Dict[str, List[Optional[str]]] = {}
 
     for node in ast.walk(func_ast):
@@ -913,7 +963,7 @@ def _extract_alloc_shape_axes(
         if not isinstance(shape_arg, (ast.Tuple, ast.List)):
             continue
         result[node.targets[0].id] = [
-            _shape_elt_to_axis(elt, param_to_axis, ceildiv_alias_map)
+            _shape_elt_to_axis(elt, param_to_axis, celdiv_alias_map, tunable_params)
             for elt in shape_arg.elts
         ]
 
@@ -954,6 +1004,7 @@ def _extract_reduce_call_evidence(
     func_ast: ast.AST,
     param_to_axis: Dict[str, str],
     ceildiv_alias_map: Dict[str, Tuple[str, str]],
+    tunable_params: Optional[Set[str]] = None,
 ) -> List[_ReductionCallEvidence]:
     """
     Extract reduction axes from ``T.reduce`` call sites.
@@ -971,6 +1022,13 @@ def _extract_reduce_call_evidence(
     resolved statically, letting us distinguish "dims keyword not present"
     from "dims resolved to an empty list".
 
+    ``tunable_params`` is forwarded to ``_extract_alloc_shape_axes`` so that
+    block-size params (``block_N``, ``block_K``) are not mistaken for axis
+    names when they appear in alloc shapes.  Without this guard a
+    ``T.alloc_shared((block_M, block_N), …)`` would produce an input-axes
+    list of ``["M", "block_N"]`` and a ``T.reduce(..., dims=[1])`` would
+    register ``"block_N"`` as a reduction axis instead of the correct ``"N"``.
+
     Example::
 
         A_shared = T.alloc_shared((block_M, N), "float16")
@@ -978,7 +1036,7 @@ def _extract_reduce_call_evidence(
         # input_axes = ["M", "N"],  dims=[1]  →  reduction axis = "N"
     """
     alloc_shape_axes = _extract_alloc_shape_axes(
-        func_ast, param_to_axis, ceildiv_alias_map
+        func_ast, param_to_axis, ceildiv_alias_map, tunable_params
     )
     results: List[_ReductionCallEvidence] = []
     seen_axes: Set[str] = set()
@@ -1027,13 +1085,34 @@ def _shape_elt_to_axis(
     elt: ast.AST,
     param_to_axis: Dict[str, str],
     ceildiv_alias_map: Dict[str, Tuple[str, str]],
+    tunable_params: Optional[Set[str]] = None,
 ) -> Optional[str]:
+    """
+    Map a single shape-tuple element to its logical axis name.
+
+    ``tunable_params`` guards against treating block-size params (``block_N``,
+    ``block_K``, …) as axis names.  When a ``Name`` node refers to a tunable
+    param that has no entry in ``param_to_axis`` the element is a tile-size
+    knob, not a problem-dimension axis — return ``None`` so the caller can
+    skip it or defer until ``param_to_axis`` is populated.
+
+    Resolution order:
+    1. ``param_to_axis`` lookup  (block_M → "M" once split/tiling evidence built)
+    2. ``ceildiv_alias_map`` lookup  (grid_m → "M")
+    3. Tunable param guard  (block_N not yet in param_to_axis → None)
+    4. Raw name  (N used directly in shape)
+    5. Nested Name / ceildiv inside a compound expression
+    """
     if isinstance(elt, ast.Name):
         name = elt.id
         if name in param_to_axis:
             return param_to_axis[name]
         if name in ceildiv_alias_map:
             return ceildiv_alias_map[name][0]
+        # Block-size tunable params (block_N, block_K, …) are tile-size knobs,
+        # not axis names.  Return None so they are not registered as phantom axes.
+        if tunable_params and name in tunable_params:
+            return None
         return name  # raw problem-size var used directly in shape
 
     if _is_ceildiv(elt):
@@ -1053,8 +1132,17 @@ def _extract_low_dim_axes(
     func_ast: ast.AST,
     param_to_axis: Dict[str, str],
     ceildiv_alias_map: Dict[str, Tuple[str, str]],
+    tunable_params: Optional[Set[str]] = None,
 ) -> List[str]:
-    """Last element of each T.alloc_shared / T.alloc_fragment shape → low dim."""
+    """Last element of each T.alloc_shared / T.alloc_fragment shape → low dim.
+
+    ``tunable_params`` is forwarded to ``_shape_elt_to_axis`` so that
+    block-size params (``block_N``, ``block_K``, …) are not registered as
+    phantom low-dim axes when they appear as the last element of an alloc
+    shape.  The correct axis name is recovered via ``param_to_axis`` once
+    tiling evidence has been built (``block_N → N``); until then the element
+    is skipped rather than emitting a spurious ``"block_N"`` axis.
+    """
     low_dims: List[str] = []
     seen: Set[str] = set()
 
@@ -1078,7 +1166,9 @@ def _extract_low_dim_axes(
         if not isinstance(shape_arg, (ast.Tuple, ast.List)) or not shape_arg.elts:
             continue
 
-        axis = _shape_elt_to_axis(shape_arg.elts[-1], param_to_axis, ceildiv_alias_map)
+        axis = _shape_elt_to_axis(
+            shape_arg.elts[-1], param_to_axis, ceildiv_alias_map, tunable_params
+        )
         if axis and axis not in seen:
             seen.add(axis)
             low_dims.append(axis)
@@ -1159,31 +1249,24 @@ def parse_tl_axis_semantic(
         )
 
     # 3. Build TileLang-specific signature
-    #
-    #    Rules:
-    #      ceildiv divisors  (block_M, block_K)  → is_constexpr=True → TUNABLE
-    #      ceildiv numerators (M, N, K)           → is_constexpr=True → FIXED_COMPILE_TIME
-    #      shape-only params (N in alloc/Tensor)  → is_constexpr=True → FIXED_COMPILE_TIME
-    #      unrelated params  (num_stages,threads) → is_constexpr=False → RUNTIME_NON_TUNABLE
-    #
-    #    classify_length_symbol gates the provided_args lookup behind is_constexpr,
-    #    so M must be marked constexpr to get FIXED_COMPILE_TIME when M is in provided_args.
     signature = _build_tl_signature(func_node, provided_args, tunable_params)
 
     # 4. Ceildiv alias map
     ceildiv_alias_map = _build_ceildiv_alias_map(func_node)
 
-    # 5. Split evidence (T.Kernel grid args) extract T.ceildiv(M, block_M) , T.ceildiv(M,bM) * T.ceildiv(N,bN),floor-div (M+bM-1)//bM
+    # 5. Split evidence (T.Kernel grid args)
     split_evidences = _extract_split_evidence(
         func_node, tunable_params, ceildiv_alias_map
     )
 
-    # 6. Tiling / reduction evidence (loops)
+    # 6. Tiling / reduction evidence (T.Pipelined / T.serial / range / tl_range)
     tiling_evidences = _extract_tiling_evidence(
         func_node, tunable_params, ceildiv_alias_map
     )
 
     # 7. param → axis mapping (for low-dim and T.reduce extraction)
+    #    Built from BOTH split and tiling evidence so that block_N → N is
+    #    available when processing alloc shapes and T.reduce call sites.
     param_to_axis: Dict[str, str] = {}
     for ev in split_evidences:
         param_to_axis.setdefault(ev.param_name, ev.axis_name)
@@ -1191,11 +1274,13 @@ def parse_tl_axis_semantic(
         param_to_axis.setdefault(ev.param_name, ev.axis_name)
 
     # 8. T.reduce reduction axes and low-dim axes
+    #    Pass tunable_params so _shape_elt_to_axis can distinguish block-size
+    #    params (block_N) from problem-dimension axis names (N).
     reduce_call_evidences = _extract_reduce_call_evidence(
-        func_node, param_to_axis, ceildiv_alias_map
+        func_node, param_to_axis, ceildiv_alias_map, tunable_params
     )
     low_dim_axes_list = _extract_low_dim_axes(
-        func_node, param_to_axis, ceildiv_alias_map
+        func_node, param_to_axis, ceildiv_alias_map, tunable_params
     )
     low_dim_set = set(low_dim_axes_list)
 
@@ -1237,7 +1322,7 @@ def parse_tl_axis_semantic(
             status="failed",
             diagnostics=diagnostics
             + [
-                "no axis information resolved from T.Kernel / T.Pipelined / range / T.reduce"
+                "no axis information resolved from T.Kernel / T.Pipelined / T.serial / range / T.reduce"
             ],
         )
 
@@ -1419,13 +1504,28 @@ def parse_tl_axis_info(
         def elementwise_add(M, block_M):   # no constexpr annotation
             @T.prim_func
             def elemAdd(A: T.Tensor((M,),"float16"), ...):
-                with T.Kernel(T.ceildiv(M, block_M), is_npu=True) as (bid, _):
+                with T.Kernel(T.ceildiv(M, block_M), is_npu=True) as bx:
                     ...
 
         result = parse_tl_axis_info(ast.parse(src), provided_args={"M": 64})
         # result.split_params  = {"M": "block_M"}
         # result.axis_pid_dims = {"M": 0}
         # sem.axes["M"].extent.state = "fixed_compile_time"  (value=64)
+
+    rms_norm example::
+
+        def rms_norm(M, N, block_M, block_N):
+            for ko in T.serial(T.ceildiv(N, block_N)):   # tiling axis
+                T.reduce(...)
+            with T.Kernel(T.ceildiv(M, block_M), is_npu=True) as bx:  # split axis
+                ...
+
+        result = parse_tl_axis_info(ast.parse(src), provided_args={"M": 32, "N": 256})
+        # result.split_params  = {"M": "block_M"}
+        # result.tiling_params = {"N": "block_N"}
+        # result.reduction_axes = ["N"]
+        # result.axis_pid_dims = {"M": 0}
+        # result.status = "ok"
     """
     semantic_result = parse_tl_axis_semantic(
         func_ast,
