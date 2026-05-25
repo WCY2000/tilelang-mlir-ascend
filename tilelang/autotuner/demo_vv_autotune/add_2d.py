@@ -12,7 +12,7 @@ from tilelang.autotuner.dsl_analysis.vv_param_parser import (
     parse_tl_axis_info_from_fn,
     print_vv_axis_parse_result,
 )
-from tilelang.carver.arch.ascend import Ascend
+from tilelang.utils.npu_arch import AscendArch
 
 os.environ["TILELANG_ASCEND_MODE"] = "Developer"
 SHAPES = [
@@ -52,7 +52,7 @@ def run_single_shape(shape, log_dir: Path):
                 return x + y
 
             def get_config():
-                arch = Ascend()
+                arch = AscendArch()
                 carver_template = carver.ElementwiseTemplate(
                     shape=[M, N],
                     dtype="float16",
