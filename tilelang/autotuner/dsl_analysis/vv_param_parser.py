@@ -1101,7 +1101,9 @@ def _shape_elt_to_axis(
     2. ``ceildiv_alias_map`` lookup  (grid_m → "M")
     3. Tunable param guard  (block_N not yet in param_to_axis → None)
     4. Raw name  (N used directly in shape)
-    5. Nested Name / ceildiv inside a compound expression
+    5. Nested Name inside a compound expression (e.g. ``head_dim // 2`` →
+       ``"head_dim"``).  Non-tunable Name nodes inside BinOp / compound exprs
+       are treated as problem-dimension variables.
     """
     if isinstance(elt, ast.Name):
         name = elt.id
@@ -1118,12 +1120,23 @@ def _shape_elt_to_axis(
     if _is_ceildiv(elt):
         return _ast_to_text(elt.args[0])
 
+    # FIX: handle compound expressions such as ``head_dim // 2`` or
+    # ``seq_len * 2``.  Walk child Name nodes and return the first one that
+    # is not a tunable block-size param.  This correctly maps
+    # ``head_dim // 2`` → ``"head_dim"`` instead of returning None.
     for child in ast.walk(elt):
-        if isinstance(child, ast.Name):
-            if child.id in param_to_axis:
-                return param_to_axis[child.id]
-            if child.id in ceildiv_alias_map:
-                return ceildiv_alias_map[child.id][0]
+        if not isinstance(child, ast.Name):
+            continue
+        name = child.id
+        if name in param_to_axis:
+            return param_to_axis[name]
+        if name in ceildiv_alias_map:
+            return ceildiv_alias_map[name][0]
+        # Skip tunable block-size params embedded in compound exprs.
+        if tunable_params and name in tunable_params:
+            continue
+        # Any remaining identifier is a problem-dimension variable.
+        return name
 
     return None
 
@@ -1142,6 +1155,11 @@ def _extract_low_dim_axes(
     shape.  The correct axis name is recovered via ``param_to_axis`` once
     tiling evidence has been built (``block_N → N``); until then the element
     is skipped rather than emitting a spurious ``"block_N"`` axis.
+
+    1D shapes (single element) are skipped: a 1D allocation has no meaningful
+    high-dim / low-dim distinction, so marking the sole axis as low-dim would
+    produce misleading output and cause redundant tile-descent work in
+    TileGenerator.
     """
     low_dims: List[str] = []
     seen: Set[str] = set()
@@ -1164,6 +1182,11 @@ def _extract_low_dim_axes(
             continue
         shape_arg = call.args[0]
         if not isinstance(shape_arg, (ast.Tuple, ast.List)) or not shape_arg.elts:
+            continue
+
+        # FIX: skip 1D shapes — no high-dim / low-dim distinction is meaningful
+        # for a single-element allocation (e.g. T.alloc_shared((block_M,), …)).
+        if len(shape_arg.elts) <= 1:
             continue
 
         axis = _shape_elt_to_axis(
